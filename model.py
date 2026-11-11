@@ -1,12 +1,14 @@
 from pathlib import Path
 import numpy as np
 from numba import njit
-from math import sqrt
+from math import sqrt, pi
 import tkinter as tk
 from PIL import ImageTk, Image
 
-COLOR_MIN = 128
+COLOR_MIN = 196
 COLOR_MAX = 256
+ROTATION_STEP = pi/12
+OFFSET_STEP = 1
 LIGHT_DIR = np.array([1/3, 1/2, 1], dtype=np.float64)
 LIGHT_DIR = LIGHT_DIR / np.linalg.norm(LIGHT_DIR)
 EPSILON = 0.1e-8
@@ -47,7 +49,7 @@ def triangle(buf, z_buf, W, H, r, g, b,
 
 @njit(cache=True)
 def render_model(buf, z_buf, vertices, faces, colors,
-                 W, H, scale, light_dir):
+                 W, H, scale, light_dir, projection):
     for i in range(faces.shape[0]):
         first, second, third = faces[i]
 
@@ -73,13 +75,21 @@ def render_model(buf, z_buf, vertices, faces, colors,
             continue
 
         cosine = dot / norm
-
+        
         px0 = x0 * scale + W / 2.0
         py0 = -y0 * scale + H / 2.0
         px1 = x1 * scale + W / 2.0
         py1 = -y1 * scale + H / 2.0
         px2 = x2 * scale + W / 2.0
         py2 = -y2 * scale + H / 2.0
+
+        if projection == "perspective":
+            px0 = (px0 - W/2.0)/z0 + W/2.0
+            py0 = (py0 - W/2.0)/z0 + H/2.0
+            px1 = (px1 - W/2.0)/z1 + W/2.0
+            py1 = (py1 - W/2.0)/z1 + H/2.0
+            px2 = (px2 - W/2.0)/z2 + W/2.0
+            py2 = (py2 - W/2.0)/z2 + H/2.0
 
         intensity = -cosine
         r, g, b = colors[i] * intensity
@@ -93,15 +103,15 @@ def render_model(buf, z_buf, vertices, faces, colors,
 
 
 class Model:
-    def __init__(self, path):
+    def __init__(self, path, scale):
         p = self._validate_path(path)
         self._parse_file(p)
         self._faces_to_edges()
-        '''self.colors = np.random.randint(
+        self.colors = np.random.randint(
             COLOR_MIN, COLOR_MAX, size=(len(self.faces), 3), dtype=np.uint8
-        )'''
-        self.colors = np.full((len(self.faces), 3), 255, dtype=np.uint8)
+        )
         self.light_dir = LIGHT_DIR
+        self.vertices[:] *= [scale, scale, scale]
 
     def _faces_to_edges(self):
         self.edges = np.concatenate([
@@ -189,16 +199,40 @@ class Renderer:
         self.W = W
         self.H = H
         self.scale = scale
+        self.xOffset = 0
+        self.yOffset = 0
+        self.zOffset = 0.2*scale
+        self.xRotation = 0
+        self.yRotation = 0
+        self.zRotation = 0
         self.img = np.zeros((H, W, 3), dtype=np.uint8)
         self.zbuf = np.full((H, W), np.inf, dtype=np.float64)
+        self.projection = 'perspective'
 
     def render(self, model):
         self.img.fill(0)
         self.zbuf.fill(np.inf)
+        transformed_vertices = model.vertices.copy()
+
+        if any(r != 0 for r in (self.xRotation, self.yRotation, self.zRotation)):
+            cx, sx = np.cos(self.xRotation), np.sin(self.xRotation)
+            cy, sy = np.cos(self.yRotation), np.sin(self.yRotation)
+            cz, sz = np.cos(self.zRotation), np.sin(self.zRotation)
+            
+            Rx = np.array([[1, 0, 0], [0, cx, sx], [0, -sx, cx]])
+            Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+            Rz = np.array([[cz, sz, 0], [-sz, cz, 0], [0, 0, 1]])
+            
+            R = Rx @ Ry @ Rz
+            transformed_vertices = model.vertices @ R.T
+        
+        transformed_vertices[:] += [self.xOffset, self.yOffset, self.zOffset]
+        
         render_model(
-            self.img, self.zbuf,
-            model.vertices, model.faces, model.colors,
-            self.W, self.H, self.scale, model.light_dir
+            self.img, self.zbuf, transformed_vertices,
+            model.faces, model.colors, self.W, self.H,
+            self.scale if self.projection == "perspective" else 1,
+            model.light_dir, projection = self.projection
         )
 
 class App:
@@ -224,26 +258,60 @@ class App:
         self.render()
 
     def on_key(self, event):
-        k = event.keysym
+        k = event.keysym.lower()
+        print(k, self.renderer.xOffset, self.renderer.yOffset, self.renderer.zOffset)
         if k == 'space':
             Image.fromarray(self.renderer.img).save(self.out_path)
             return 'break'
-        elif k == 'plus':
+        elif k == 'r':
+            self.renderer.projection = "perspective" if \
+                                       self.renderer.projection == "parallel" \
+                                       else "parallel"
+        # camera movement
+        elif k == 'up':
+            self.model.vertices -= [0, 1/sqrt(self.renderer.scale), 0]
+        elif k == 'down':
+            self.model.vertices += [0, 1/sqrt(self.renderer.scale), 0]
+        elif k == 'left':
+            self.model.vertices += [1/sqrt(self.renderer.scale), 0, 0]
+        elif k == 'right':
+            self.model.vertices -= [1/sqrt(self.renderer.scale), 0, 0]
+            
+        # render scale
+        elif k == 'plus' or k == 'equal':
             self.renderer.scale *= 1.1
         elif k == 'minus':
             self.renderer.scale /= 1.1
-        elif k == 'Up':
-            self.model.vertices -= [0, 1/sqrt(self.renderer.scale), 0]
-        elif k == 'Down':
-            self.model.vertices += [0, 1/sqrt(self.renderer.scale), 0]
-        elif k == 'Left':
-            self.model.vertices += [1/sqrt(self.renderer.scale), 0, 0]
-        elif k == 'Right':
-            self.model.vertices -= [1/sqrt(self.renderer.scale), 0, 0]
-            
+
+        # model rotation
+        elif k == 'w':
+            self.renderer.xRotation += ROTATION_STEP
+        elif k == 's':
+            self.renderer.xRotation -= ROTATION_STEP
+        elif k == 'a':
+            self.renderer.yRotation += ROTATION_STEP
+        elif k == 'd':
+            self.renderer.yRotation -= ROTATION_STEP
+        elif k == 'q':
+            self.renderer.zRotation += ROTATION_STEP
+        elif k == 'e':
+            self.renderer.zRotation -= ROTATION_STEP
+
+        # model offset
+        elif k == '6': #left
+            self.renderer.xOffset += OFFSET_STEP*sqrt(self.renderer.scale)
+        elif k == '4': #right
+            self.renderer.xOffset -= OFFSET_STEP*sqrt(self.renderer.scale)
+        elif k == '8': #up
+            self.renderer.yOffset += OFFSET_STEP*sqrt(self.renderer.scale)
+        elif k == '2': #down
+            self.renderer.yOffset -= OFFSET_STEP*sqrt(self.renderer.scale)
+        elif k == '5': #front
+            self.renderer.zOffset -= OFFSET_STEP*sqrt(self.renderer.scale)
+        elif k == '0': #back
+            self.renderer.zOffset += OFFSET_STEP*sqrt(self.renderer.scale)
         else:
             return
-
         self.render()
         return 'break'
 
